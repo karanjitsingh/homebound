@@ -17,6 +17,7 @@ If run without root privileges, the server will automatically fall back to port 
 * `--host`: Bind address (default: `0.0.0.0`)
 * `--port`: Port to run the dashboard on (default: `80`, fallback: `8080` if not run as root)
 * `--interval`: Scanning cooldown interval in seconds (default: `60`)
+* `--public`: Disable private restriction and allow connections from any IP address (by default, connections are restricted to localhost, local LAN, and Tailscale networks)
 
 Example to run on a custom port:
 ```bash

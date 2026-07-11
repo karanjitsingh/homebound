@@ -11,6 +11,7 @@ import argparse
 import subprocess
 import http.server
 from concurrent.futures import ThreadPoolExecutor
+import ipaddress
 
 # File to store user customizations
 CUSTOMIZATIONS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "customizations.json")
@@ -614,6 +615,43 @@ class HomeboundHandler(http.server.BaseHTTPRequestHandler):
         else:
             self.send_error(404, "Route Not Found")
 
+class RestrictedHTTPServer(http.server.ThreadingHTTPServer):
+    def __init__(self, server_address, RequestHandlerClass, restrict_access=True):
+        self.restrict_access = restrict_access
+        super().__init__(server_address, RequestHandlerClass)
+
+    def verify_request(self, request, client_address):
+        if not self.restrict_access:
+            return True
+        
+        client_ip = client_address[0]
+        if '%' in client_ip:
+            client_ip = client_ip.split('%')[0]
+        
+        try:
+            ip = ipaddress.ip_address(client_ip)
+            # Allowed subnets:
+            # 1. Loopback (localhost): 127.0.0.0/8, ::1/128
+            # 2. Tailscale: 100.64.0.0/10, fd7a:115c:a1e0::/48
+            # 3. Private LAN: 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fe80::/10 (link-local)
+            allowed_networks = [
+                ipaddress.ip_network("127.0.0.0/8"),
+                ipaddress.ip_network("::1/128"),
+                ipaddress.ip_network("100.64.0.0/10"),
+                ipaddress.ip_network("fd7a:115c:a1e0::/48"),
+                ipaddress.ip_network("10.0.0.0/8"),
+                ipaddress.ip_network("172.16.0.0/12"),
+                ipaddress.ip_network("192.168.0.0/16"),
+                ipaddress.ip_network("fe80::/10"),
+            ]
+            if any(ip in net for net in allowed_networks):
+                return True
+        except ValueError:
+            pass
+        
+        print(f"[Homebound] Blocked unauthorized connection attempt from: {client_ip}")
+        return False
+
 def main():
     global server_state
     
@@ -621,6 +659,7 @@ def main():
     parser.add_argument("--host", default="0.0.0.0", help="Hostname/IP to bind to (default: 0.0.0.0)")
     parser.add_argument("--port", type=int, default=80, help="Port to run index server on (default: 80)")
     parser.add_argument("--interval", type=int, default=60, help="Scan interval in seconds (default: 60)")
+    parser.add_argument("--public", action="store_true", help="Allow connections from any IP address (publicly accessible)")
     args = parser.parse_args()
 
     server_state = ServerState(host=args.host, port=args.port, scan_interval=args.interval)
@@ -631,11 +670,13 @@ def main():
 
     # Try binding to server port
     try:
-        server = http.server.ThreadingHTTPServer((args.host, args.port), HomeboundHandler)
+        server = RestrictedHTTPServer((args.host, args.port), HomeboundHandler, restrict_access=not args.public)
         print(f"\n=======================================================")
         print(f"🚀 Homebound Dashboard successfully started!")
         print(f"👉 Open in browser: http://localhost:{args.port}/")
         print(f"👉 Binding Address: {args.host}:{args.port}")
+        if not args.public:
+            print(f"🔒 Access restricted to localhost, local LAN, and Tailscale networks")
         print(f"=======================================================\n")
     except PermissionError:
         print(f"\n❌ Error: Permission denied for port {args.port}.")
@@ -647,11 +688,13 @@ def main():
         # Re-run initial scan using the correct fallback port excluded
         run_scan()
         try:
-            server = http.server.ThreadingHTTPServer((args.host, 8080), HomeboundHandler)
+            server = RestrictedHTTPServer((args.host, 8080), HomeboundHandler, restrict_access=not args.public)
             print(f"=======================================================")
             print(f"🚀 Homebound Dashboard successfully started (Fallback)!")
             print(f"👉 Open in browser: http://localhost:8080/")
             print(f"👉 Binding Address: {args.host}:8080")
+            if not args.public:
+                print(f"🔒 Access restricted to localhost, local LAN, and Tailscale networks")
             print(f"=======================================================\n")
         except Exception as fallback_err:
             print(f"❌ Fallback port 8080 binding failed: {fallback_err}")
