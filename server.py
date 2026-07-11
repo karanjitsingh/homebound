@@ -701,30 +701,62 @@ class RestrictedHTTPServer(http.server.ThreadingHTTPServer):
 
 def get_ssl_context():
     """Checks if Tailscale certs are present and returns an SSLContext if so."""
-    tailscale_dir = os.path.expanduser("~/tailscale")
+    sudo_user = os.environ.get("SUDO_USER")
+    if sudo_user:
+        try:
+            import pwd
+            user_home = pwd.getpwnam(sudo_user).pw_dir
+            tailscale_dir = os.path.join(user_home, "tailscale")
+        except Exception:
+            tailscale_dir = f"/home/{sudo_user}/tailscale"
+    else:
+        tailscale_dir = os.path.expanduser("~/tailscale")
+
+    if not os.path.exists(tailscale_dir):
+        print(f"[Homebound] Tailscale directory not found at {tailscale_dir}. HTTPS disabled.", flush=True)
+        return None
+
     domain_file = os.path.join(tailscale_dir, "domain")
     if not os.path.exists(domain_file):
+        print(f"[Homebound] Tailscale domain file not found at {domain_file}. HTTPS disabled.", flush=True)
         return None
         
     try:
         with open(domain_file, "r") as f:
             domain = f.read().strip()
         if not domain:
+            print(f"[Homebound] Tailscale domain file at {domain_file} is empty. HTTPS disabled.", flush=True)
             return None
             
         cert_file = os.path.join(tailscale_dir, f"{domain}.crt")
         key_file = os.path.join(tailscale_dir, f"{domain}.key")
         
         # Also handle domain.key literally as fallback
+        key_fallback_used = False
         if not os.path.exists(key_file):
             key_file = os.path.join(tailscale_dir, "domain.key")
+            key_fallback_used = True
             
-        if os.path.exists(cert_file) and os.path.exists(key_file):
+        cert_exists = os.path.exists(cert_file)
+        key_exists = os.path.exists(key_file)
+        
+        if cert_exists and key_exists:
             context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
             context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+            print(f"[Homebound] Successfully loaded Tailscale SSL context for domain {domain}.", flush=True)
             return context
+        else:
+            missing_parts = []
+            if not cert_exists:
+                missing_parts.append(f"cert file ({cert_file})")
+            if not key_exists:
+                if key_fallback_used:
+                    missing_parts.append(f"key file ({key_file} or {domain}.key)")
+                else:
+                    missing_parts.append(f"key file ({key_file})")
+            print(f"[Homebound] Missing Tailscale files: {', '.join(missing_parts)}. HTTPS disabled.", flush=True)
     except Exception as e:
-        print(f"[Homebound] Error loading Tailscale SSL context: {e}")
+        print(f"[Homebound] Error loading Tailscale SSL context: {e}. HTTPS disabled.", flush=True)
         
     return None
 
@@ -737,18 +769,28 @@ def main():
     parser.add_argument("--interval", type=int, default=60, help="Scan interval in seconds (default: 60)")
     parser.add_argument("--public", action="store_true", help="Allow connections from any IP address (publicly accessible)")
     args = parser.parse_args()
+    ssl_context = get_ssl_context()
+    
+    # If HTTPS is active and port is the default 80, switch it to 443
+    port = args.port
+    is_port_explicit = False
+    for arg in sys.argv:
+        if arg.startswith("--port") or arg == "-p":
+            is_port_explicit = True
+            break
+            
+    if ssl_context and not is_port_explicit and port == 80:
+        port = 443
 
-    server_state = ServerState(host=args.host, port=args.port, scan_interval=args.interval)
+    server_state = ServerState(host=args.host, port=port, scan_interval=args.interval)
 
     # Perform initial scan in main thread to ensure cache is ready on server start
     print("[Homebound] Performing initial startup socket scan...")
     run_scan()
 
-    ssl_context = get_ssl_context()
-
     # Try binding to server port
     try:
-        server = RestrictedHTTPServer((args.host, args.port), HomeboundHandler, restrict_access=not args.public)
+        server = RestrictedHTTPServer((args.host, port), HomeboundHandler, restrict_access=not args.public)
         if ssl_context:
             server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
             proto_prefix = "https"
@@ -757,22 +799,23 @@ def main():
 
         print(f"\n=======================================================")
         print(f"🚀 Homebound Dashboard successfully started!")
-        print(f"👉 Open in browser: {proto_prefix}://localhost:{args.port}/")
-        print(f"👉 Binding Address: {args.host}:{args.port}")
+        print(f"👉 Open in browser: {proto_prefix}://localhost:{port}/")
+        print(f"👉 Binding Address: {args.host}:{port}")
         if not args.public:
             print(f"🔒 Access restricted to localhost, local LAN, and Tailscale networks")
         print(f"=======================================================\n")
     except PermissionError:
-        print(f"\n❌ Error: Permission denied for port {args.port}.")
-        print(f"ℹ️  Ports below 1024 (like 80) require root/administrator privileges.")
-        print(f"ℹ️  To run on port 80, try: sudo python3 {sys.argv[0]} --port 80")
-        print(f"⚠️  Falling back to port 8080 instead...\n")
+        # Determine fallback port based on SSL
+        fallback_port = 8443 if ssl_context else 8080
+        print(f"\n❌ Error: Permission denied for port {port}.")
+        print(f"ℹ️  To run on port {port}, try: sudo python3 {sys.argv[0]}")
+        print(f"⚠️  Falling back to port {fallback_port} instead...\n")
         
-        server_state.port = 8080
+        server_state.port = fallback_port
         # Re-run initial scan using the correct fallback port excluded
         run_scan()
         try:
-            server = RestrictedHTTPServer((args.host, 8080), HomeboundHandler, restrict_access=not args.public)
+            server = RestrictedHTTPServer((args.host, fallback_port), HomeboundHandler, restrict_access=not args.public)
             if ssl_context:
                 server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
                 proto_prefix = "https"
@@ -781,13 +824,13 @@ def main():
 
             print(f"=======================================================")
             print(f"🚀 Homebound Dashboard successfully started (Fallback)!")
-            print(f"👉 Open in browser: {proto_prefix}://localhost:8080/")
-            print(f"👉 Binding Address: {args.host}:8080")
+            print(f"👉 Open in browser: {proto_prefix}://localhost:{fallback_port}/")
+            print(f"👉 Binding Address: {args.host}:{fallback_port}")
             if not args.public:
                 print(f"🔒 Access restricted to localhost, local LAN, and Tailscale networks")
             print(f"=======================================================\n")
         except Exception as fallback_err:
-            print(f"❌ Fallback port 8080 binding failed: {fallback_err}")
+            print(f"❌ Fallback port {fallback_port} binding failed: {fallback_err}")
             sys.exit(1)
     except Exception as e:
         print(f"❌ Server binding failed: {e}")
