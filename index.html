@@ -786,12 +786,16 @@
             align-items: center;
             gap: 0.5rem;
             z-index: 9999;
-            transform: translateY(150%);
-            transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            opacity: 0;
+            pointer-events: none;
+            transform: translateY(calc(100% + 3rem));
+            transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), opacity 0.3s ease;
             backdrop-filter: blur(10px);
         }
 
         .toast.show {
+            opacity: 1;
+            pointer-events: auto;
             transform: translateY(0);
         }
 
@@ -827,7 +831,7 @@
         <!-- Header -->
         <header>
             <div class="logo-section">
-                <h1>Homebound <span class="badge">Local Index</span></h1>
+                <h1>Homebound</h1>
                 <p>Discovers and redirects to hosted web services on this machine</p>
             </div>
             <div class="actions-section">
@@ -988,7 +992,8 @@
         });
 
         async function fetchServers() {
-            showLoader(true);
+            const hasCards = document.querySelectorAll('.service-card').length > 0;
+            if (!hasCards) showLoader(true);
             try {
                 const response = await fetch('/api/servers');
                 const data = await response.json();
@@ -1003,7 +1008,8 @@
 
         async function triggerRescan() {
             setScanningButtonState(true);
-            showLoader(true);
+            const hasCards = document.querySelectorAll('.service-card').length > 0;
+            if (!hasCards) showLoader(true);
             try {
                 const response = await fetch('/api/scan');
                 const data = await response.json();
@@ -1091,11 +1097,7 @@
         }
 
         function updateGrid() {
-            // Remove existing cards
             const grid = document.getElementById('services-grid');
-            const existingCards = grid.querySelectorAll('.service-card');
-            existingCards.forEach(c => c.remove());
-
             const emptyState = document.getElementById('empty-state');
 
             // Apply filter based on current toggle mode
@@ -1126,15 +1128,50 @@
 
             if (filteredServers.length === 0) {
                 emptyState.style.display = 'flex';
+                const existingCards = grid.querySelectorAll('.service-card');
+                existingCards.forEach(c => c.remove());
                 return;
             } else {
                 emptyState.style.display = 'none';
             }
 
-            // Create cards
+            // Map filtered servers by port for easy lookup
+            const serverMap = new Map(filteredServers.map(s => [s.port, s]));
+
+            // Get currently rendered cards
+            const currentCards = Array.from(grid.querySelectorAll('.service-card'));
+
+            // 1. Remove cards for ports that are no longer in the filtered list
+            currentCards.forEach(card => {
+                const port = parseInt(card.dataset.port);
+                if (!serverMap.has(port)) {
+                    card.remove();
+                }
+            });
+
+            // 2. Add or update cards
             filteredServers.forEach((server, index) => {
-                const card = createCardElement(server, index);
-                grid.appendChild(card);
+                const existingCard = grid.querySelector(`.service-card[data-port="${server.port}"]`);
+                if (existingCard) {
+                    // Update in-place only if data changed
+                    const oldDataStr = existingCard.dataset.serverJson;
+                    const newDataStr = JSON.stringify(server);
+                    if (oldDataStr !== newDataStr) {
+                        existingCard.dataset.serverJson = newDataStr;
+                        updateCardContent(existingCard, server);
+                    }
+                } else {
+                    // Create new card and append it
+                    const card = createCardElement(server, index);
+                    // To insert it in the correct sorted port order, find the correct sibling
+                    const siblings = Array.from(grid.querySelectorAll('.service-card'));
+                    const nextSibling = siblings.find(s => parseInt(s.dataset.port) > server.port);
+                    if (nextSibling) {
+                        grid.insertBefore(card, nextSibling);
+                    } else {
+                        grid.appendChild(card);
+                    }
+                }
             });
 
             // Keep text filters active
@@ -1158,8 +1195,6 @@
             if (name.includes('nginx')) return '🟢';
             if (name.includes('apache') || name.includes('httpd')) return '🪶';
             if (name.includes('transmission') || title.includes('transmission') || port === 9091) return '⚡';
-            if (name.includes('python')) return '🐍';
-            if (name.includes('node') || name.includes('express')) return '📦';
             if (port === 3000 || port === 3001 || port === 8000 || port === 8080) return '🚀';
             if (port === 443 || server.protocol === 'https') return '🔒';
             
@@ -1169,10 +1204,20 @@
         function createCardElement(server, index) {
             const card = document.createElement('div');
             card.className = 'service-card';
+            card.dataset.port = server.port;
+            card.dataset.serverJson = JSON.stringify(server);
             card.style.animationDelay = `${index * 0.05}s`;
+            updateCardContent(card, server);
+            return card;
+        }
+
+        function updateCardContent(card, server) {
             if (server.ignored) {
                 card.style.opacity = '0.55';
                 card.style.borderStyle = 'dashed';
+            } else {
+                card.style.opacity = '';
+                card.style.borderStyle = '';
             }
 
             const icon = getServiceIcon(server);
@@ -1187,15 +1232,10 @@
                 ? `${protocol}://${window.location.hostname}:${server.port}`
                 : `tcp://${window.location.hostname}:${server.port}`;
 
-            // Check if there is a custom image override, otherwise use the favicon
+            // Check if there is a custom image override, otherwise use the proxied favicon
             let imageUrl = server.image;
             if (!imageUrl && isHttp && server.favicon) {
-                if (server.favicon.startsWith('http://') || server.favicon.startsWith('https://') || server.favicon.startsWith('//')) {
-                    imageUrl = server.favicon;
-                } else {
-                    const separator = server.favicon.startsWith('/') ? '' : '/';
-                    imageUrl = `${protocol}://${window.location.hostname}:${server.port}${separator}${server.favicon}`;
-                }
+                imageUrl = `/api/favicon/${server.port}`;
             }
 
             const badgeContent = imageUrl 
@@ -1253,7 +1293,7 @@
                     <div class="card-header">
                         <div class="header-actions">
                             <div class="service-badge">${badgeContent}</div>
-                            <button class="btn-edit" onclick="openEditModal(${server.port}, '${escapeJs(server.title)}', '${escapeJs(server.image)}', ${server.ignored || false})" title="Edit name & image">
+                            <button class="btn-edit" onclick="openEditModal(${server.port}, '${escapeJs(displayTitle)}', '${escapeJs(server.image)}', ${server.ignored || false})" title="Edit name & image">
                                 <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path>
                                 </svg>
@@ -1262,7 +1302,7 @@
                         <div class="port-badge">:${server.port}</div>
                     </div>
                     <div class="card-body">
-                        <h3 class="service-title" title="${escapeHtml(server.title)}">${escapeHtml(displayTitle)}</h3>
+                        <h3 class="service-title" title="${escapeHtml(displayTitle)}">${escapeHtml(displayTitle)}</h3>
                         ${descriptionHtml}
                         <div class="service-meta">
                             ${metaHtml}
@@ -1271,6 +1311,7 @@
                 </div>
                 <div class="card-footer">
                     <button class="btn-copy" onclick="copyUrl('${fullLocalUrl}')" title="Copy Address">
+
                         <svg fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" d="M8 5H6a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2v-1M8 5a2 2 0 002 2h2a2 2 0 002-2M8 5a2 2 0 012-2h2a2 2 0 012 2m0 0h2a2 2 0 012 2v3m2 4H10m0 0l3-3m-3 3l3 3"></path>
                         </svg>

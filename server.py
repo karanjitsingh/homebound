@@ -470,6 +470,7 @@ def run_scan():
             if port_str in customs:
                 if customs[port_str].get("title"):
                     s["title"] = customs[port_str]["title"]
+                    s["app_name"] = customs[port_str]["title"]
                 if customs[port_str].get("image"):
                     s["image"] = customs[port_str]["image"]
                 else:
@@ -563,6 +564,52 @@ class HomeboundHandler(http.server.BaseHTTPRequestHandler):
                 }
             self.wfile.write(json.dumps(data).encode())
             
+        elif self.path.startswith("/api/favicon/"):
+            try:
+                port_str = self.path.split("/")[-1]
+                port = int(port_str)
+                
+                favicon_path = "/favicon.ico"
+                protocol = "http"
+                ip = "127.0.0.1"
+                with server_state.lock:
+                    for s in server_state.discovered_servers:
+                        if s["port"] == port:
+                            protocol = s["protocol"]
+                            favicon_path = s.get("favicon", "/favicon.ico")
+                            ip = s["ip"]
+                            break
+                            
+                if favicon_path.startswith("http://") or favicon_path.startswith("https://"):
+                    url = favicon_path
+                elif favicon_path.startswith("//"):
+                    url = f"{protocol}:{favicon_path}"
+                else:
+                    url = f"{protocol}://{ip}:{port}{favicon_path}"
+                    
+                import urllib.request
+                import ssl
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                
+                req = urllib.request.Request(
+                    url, 
+                    headers={'User-Agent': 'Homebound-Favicon-Proxy/1.0'}
+                )
+                with urllib.request.urlopen(req, context=ctx, timeout=1.5) as response:
+                    content_type = response.headers.get('Content-Type', 'image/x-icon')
+                    data = response.read()
+                    
+                self.send_response(200)
+                self.send_header("Content-Type", content_type)
+                self.send_header("Cache-Control", "public, max-age=3600")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception:
+                self.send_response(404)
+                self.end_headers()
+                
         elif self.path.startswith("/redirect/"):
             try:
                 port_str = self.path.split("/")[-1]
@@ -652,6 +699,35 @@ class RestrictedHTTPServer(http.server.ThreadingHTTPServer):
         print(f"[Homebound] Blocked unauthorized connection attempt from: {client_ip}")
         return False
 
+def get_ssl_context():
+    """Checks if Tailscale certs are present and returns an SSLContext if so."""
+    tailscale_dir = os.path.expanduser("~/tailscale")
+    domain_file = os.path.join(tailscale_dir, "domain")
+    if not os.path.exists(domain_file):
+        return None
+        
+    try:
+        with open(domain_file, "r") as f:
+            domain = f.read().strip()
+        if not domain:
+            return None
+            
+        cert_file = os.path.join(tailscale_dir, f"{domain}.crt")
+        key_file = os.path.join(tailscale_dir, f"{domain}.key")
+        
+        # Also handle domain.key literally as fallback
+        if not os.path.exists(key_file):
+            key_file = os.path.join(tailscale_dir, "domain.key")
+            
+        if os.path.exists(cert_file) and os.path.exists(key_file):
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(certfile=cert_file, keyfile=key_file)
+            return context
+    except Exception as e:
+        print(f"[Homebound] Error loading Tailscale SSL context: {e}")
+        
+    return None
+
 def main():
     global server_state
     
@@ -668,12 +744,20 @@ def main():
     print("[Homebound] Performing initial startup socket scan...")
     run_scan()
 
+    ssl_context = get_ssl_context()
+
     # Try binding to server port
     try:
         server = RestrictedHTTPServer((args.host, args.port), HomeboundHandler, restrict_access=not args.public)
+        if ssl_context:
+            server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+            proto_prefix = "https"
+        else:
+            proto_prefix = "http"
+
         print(f"\n=======================================================")
         print(f"🚀 Homebound Dashboard successfully started!")
-        print(f"👉 Open in browser: http://localhost:{args.port}/")
+        print(f"👉 Open in browser: {proto_prefix}://localhost:{args.port}/")
         print(f"👉 Binding Address: {args.host}:{args.port}")
         if not args.public:
             print(f"🔒 Access restricted to localhost, local LAN, and Tailscale networks")
@@ -689,9 +773,15 @@ def main():
         run_scan()
         try:
             server = RestrictedHTTPServer((args.host, 8080), HomeboundHandler, restrict_access=not args.public)
+            if ssl_context:
+                server.socket = ssl_context.wrap_socket(server.socket, server_side=True)
+                proto_prefix = "https"
+            else:
+                proto_prefix = "http"
+
             print(f"=======================================================")
             print(f"🚀 Homebound Dashboard successfully started (Fallback)!")
-            print(f"👉 Open in browser: http://localhost:8080/")
+            print(f"👉 Open in browser: {proto_prefix}://localhost:8080/")
             print(f"👉 Binding Address: {args.host}:8080")
             if not args.public:
                 print(f"🔒 Access restricted to localhost, local LAN, and Tailscale networks")
